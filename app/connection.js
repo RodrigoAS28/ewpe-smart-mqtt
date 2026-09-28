@@ -1,13 +1,18 @@
 const dgram = require('dgram');
 const logger = require('winston');
 const EventEmitter = require('events');
-const { encrypt, decrypt, defaultKey } = require('./encryptor');
+const { encrypt, decrypt, encryptGcm, decryptGcm, defaultKey, gcmDefaultKey } = require('./encryptor');
 
 const commandsMap = {
     'bind': 'bindok',
     'status': 'dat',
     'cmd': 'res'
 }
+
+// How long to wait for a device to answer a request before giving up. Without
+// this a device that never replies (e.g. a V2 device probed with the V1
+// protocol) leaves the bind promise pending forever.
+const REQUEST_TIMEOUT = 3000;
 
 class Connection extends EventEmitter {
     constructor(address) {
@@ -31,12 +36,12 @@ class Connection extends EventEmitter {
         this.socket.bind();
     }
 
-    registerKey(deviceId, key) {
-        this.devices[deviceId] = key;
+    registerKey(deviceId, key, version = 1) {
+        this.devices[deviceId] = { key, version };
     }
 
-    getEncryptionKey(deviceId) {
-        return this.devices[deviceId] || defaultKey;
+    getDevice(deviceId) {
+        return this.devices[deviceId];
     }
 
     scan(networks) {
@@ -50,15 +55,46 @@ class Connection extends EventEmitter {
         })
     }
 
-    async sendRequest(address, port, key, payload) {
-        return new Promise((resolve, reject) => {
-            const request = {
+    encryptRequest(payload, key, version) {
+        if (version === 2) {
+            const { pack, tag } = encryptGcm(payload, key);
+
+            return {
                 cid: 'app',
-                i: key === defaultKey ? 1 : 0,
+                i: key === gcmDefaultKey ? 1 : 0,
                 t: 'pack',
                 uid: 0,
-                pack: encrypt(payload, key)
+                tcid: payload.mac,
+                pack,
+                tag
             };
+        }
+
+        return {
+            cid: 'app',
+            i: key === defaultKey ? 1 : 0,
+            t: 'pack',
+            uid: 0,
+            pack: encrypt(payload, key)
+        };
+    }
+
+    decryptResponse(pack, key, version) {
+        return version === 2 ? decryptGcm(pack, key) : decrypt(pack, key);
+    }
+
+    async sendRequest(address, port, key, payload, version = 1) {
+        return new Promise((resolve, reject) => {
+            const request = this.encryptRequest(payload, key, version);
+
+            let timeout;
+
+            const cleanup = () => {
+                clearTimeout(timeout);
+                if (this.socket && this.socket.off) {
+                    this.socket.off('message', messageHandler);
+                }
+            }
 
             const messageHandler = (msg, rinfo) => {
                 const message = JSON.parse(msg.toString());
@@ -72,7 +108,7 @@ class Connection extends EventEmitter {
                 logger.debug(`Received message from ${message.cid} (${rinfo.address}:${rinfo.port}) ${msg.toString()}`);
 
                 try {
-                    response = decrypt(message.pack, key);
+                    response = this.decryptResponse(message.pack, key, version);
                 } catch (e) {
                     logger.error(`Can not decrypt message from ${message.cid} (${rinfo.address}:${rinfo.port}) with key ${key}`);
                     logger.debug(message.pack)
@@ -87,12 +123,14 @@ class Connection extends EventEmitter {
                     return;
                 }
 
-                if (this.socket && this.socket.off) {
-                    this.socket.off('message', messageHandler);
-                }
-
+                cleanup();
                 resolve(response);
             }
+
+            timeout = setTimeout(() => {
+                cleanup();
+                reject(new Error(`Request to ${address}:${port} (${payload.t}) timed out`));
+            }, REQUEST_TIMEOUT);
 
             logger.debug(`Sending request to ${address}:${port}: ${JSON.stringify(payload)}`);
 
@@ -114,17 +152,29 @@ class Connection extends EventEmitter {
             return;
         }
 
-        const key = this.getEncryptionKey(message.cid);
+        // A device may speak either the V1 (ECB) or V2 (GCM) protocol. Try a
+        // registered key first, then both generic keys, so discovery works
+        // regardless of firmware.
+        const registered = this.devices[message.cid];
+        const candidates = [];
+        if (registered) {
+            candidates.push(registered);
+        }
+        candidates.push({ key: defaultKey, version: 1 });
+        candidates.push({ key: gcmDefaultKey, version: 2 });
 
-        try {
-            response = decrypt(message.pack, key);
-        } catch {
-            logger.error(`Can not decrypt message from ${message.cid} (${rinfo.address}:${rinfo.port}) with key ${key}`);
-            logger.debug(message.pack)
-            return;
+        for (const { key, version } of candidates) {
+            try {
+                response = this.decryptResponse(message.pack, key, version);
+                this.emit(response.t, response, rinfo);
+                return;
+            } catch {
+                // try the next candidate
+            }
         }
 
-        this.emit(response.t, response, rinfo);
+        logger.error(`Can not decrypt message from ${message.cid} (${rinfo.address}:${rinfo.port})`);
+        logger.debug(message.pack)
     }
 }
 
