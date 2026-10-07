@@ -41,7 +41,17 @@ class DeviceManager extends EventEmitter {
         const deviceId = message.cid || message.mac;
 
         // Devices answer the scan more than once; don't bind the same one twice.
-        if (this.devices[deviceId] || this.binding[deviceId]) {
+        if (this.devices[deviceId]) {
+            // Follow the device if its IP changed (e.g. new DHCP lease)
+            const device = this.devices[deviceId];
+            if (device.address !== rinfo.address || device.port !== rinfo.port) {
+                logger.info(`Device ${deviceId} moved to ${rinfo.address}:${rinfo.port}`);
+                device.address = rinfo.address;
+                device.port = rinfo.port;
+            }
+            return;
+        }
+        if (this.binding[deviceId]) {
             return;
         }
         this.binding[deviceId] = true;

@@ -13,6 +13,7 @@ const commandsMap = {
 // this a device that never replies (e.g. a V2 device probed with the V1
 // protocol) leaves the bind promise pending forever.
 const REQUEST_TIMEOUT = 3000;
+const SCAN_INTERVAL = Number(process.env.SCAN_INTERVAL || 60000);
 
 class Connection extends EventEmitter {
     constructor(address) {
@@ -27,6 +28,11 @@ class Connection extends EventEmitter {
             logger.info(`Socket server is listening on ${socketAddress.address}:${socketAddress.port}`)
 
             this.scan(address);
+
+            // Keep scanning so devices that were offline at startup are still found
+            if (SCAN_INTERVAL > 0) {
+                setInterval(() => this.scan(address, true), SCAN_INTERVAL);
+            }
         });
 
         this.socket.on('error', (error) => {
@@ -44,13 +50,13 @@ class Connection extends EventEmitter {
         return this.devices[deviceId];
     }
 
-    scan(networks) {
+    scan(networks, quiet = false) {
         const message = Buffer.from(JSON.stringify({t: 'scan'}));
 
         this.socket.setBroadcast(true);
 
         networks.split(';').forEach((networkAddress) => {
-            logger.info(`Scanning network ${networkAddress} for available devices...`)
+            logger.log(quiet ? 'debug' : 'info', `Scanning network ${networkAddress} for available devices...`)
             this.socket.send(message, 0, message.length, 7000, networkAddress);
         })
     }
